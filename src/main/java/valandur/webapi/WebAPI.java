@@ -1,10 +1,12 @@
 package valandur.webapi;
 
+import com.google.common.reflect.TypeToken;
 import com.google.inject.Inject;
 import ninja.leaping.configurate.ConfigurationNode;
 import ninja.leaping.configurate.commented.CommentedConfigurationNode;
 import ninja.leaping.configurate.hocon.HoconConfigurationLoader;
 import ninja.leaping.configurate.loader.ConfigurationLoader;
+import ninja.leaping.configurate.objectmapping.serialize.TypeSerializers;
 import org.eclipse.jetty.server.Handler;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
@@ -18,12 +20,14 @@ import org.slf4j.Logger;
 import org.spongepowered.api.Sponge;
 import org.spongepowered.api.asset.Asset;
 import org.spongepowered.api.command.CommandManager;
+import org.spongepowered.api.command.CommandResult;
 import org.spongepowered.api.config.ConfigDir;
 import org.spongepowered.api.entity.Entity;
 import org.spongepowered.api.entity.living.player.Player;
 import org.spongepowered.api.event.Listener;
 import org.spongepowered.api.event.Order;
 import org.spongepowered.api.event.achievement.GrantAchievementEvent;
+import org.spongepowered.api.event.block.InteractBlockEvent;
 import org.spongepowered.api.event.command.SendCommandEvent;
 import org.spongepowered.api.event.entity.DestructEntityEvent;
 import org.spongepowered.api.event.entity.SpawnEntityEvent;
@@ -38,30 +42,40 @@ import org.spongepowered.api.event.item.inventory.InteractInventoryEvent;
 import org.spongepowered.api.event.message.MessageChannelEvent;
 import org.spongepowered.api.event.network.ClientConnectionEvent;
 import org.spongepowered.api.event.user.BanUserEvent;
-import org.spongepowered.api.event.world.LoadWorldEvent;
-import org.spongepowered.api.event.world.UnloadWorldEvent;
+import org.spongepowered.api.event.world.*;
 import org.spongepowered.api.plugin.Plugin;
 import org.spongepowered.api.plugin.PluginContainer;
 import org.spongepowered.api.scheduler.SpongeExecutorService;
 import org.spongepowered.api.text.Text;
 import org.spongepowered.api.text.format.TextColors;
 import org.spongepowered.api.util.Tuple;
+import valandur.webapi.block.BlockUpdate;
+import valandur.webapi.block.BlockUpdateStatusChangeEvent;
+import valandur.webapi.block.Blocks;
 import valandur.webapi.cache.*;
+import valandur.webapi.cache.chat.CachedChatMessage;
+import valandur.webapi.cache.command.CachedCommandCall;
 import valandur.webapi.command.*;
-import valandur.webapi.handlers.AuthHandler;
-import valandur.webapi.handlers.RateLimitHandler;
-import valandur.webapi.handlers.WebAPIErrorHandler;
-import valandur.webapi.hooks.WebHooks;
+import valandur.webapi.handler.AuthHandler;
+import valandur.webapi.handler.RateLimitHandler;
+import valandur.webapi.handler.ErrorHandler;
+import valandur.webapi.hook.WebHook;
+import valandur.webapi.hook.WebHookSerializer;
+import valandur.webapi.hook.WebHooks;
 import valandur.webapi.json.JsonConverter;
+import valandur.webapi.misc.Extensions;
 import valandur.webapi.misc.Util;
-import valandur.webapi.misc.WebAPICommandSource;
+import valandur.webapi.command.CommandSource;
 import valandur.webapi.misc.JettyLogger;
-import valandur.webapi.servlets.*;
+import valandur.webapi.servlet.*;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.function.Supplier;
 
 @Plugin(
         id = WebAPI.ID,
@@ -86,10 +100,15 @@ public class WebAPI {
         return WebAPI.instance;
     }
 
-    public static SpongeExecutorService syncExecutor;
+    private static SpongeExecutorService syncExecutor;
 
     private Reflections reflections;
     public Reflections getReflections() { return this.reflections; }
+
+    private boolean devMode = false;
+    public boolean isDevMode() {
+        return devMode;
+    }
 
     @Inject
     private Logger logger;
@@ -127,7 +146,11 @@ public class WebAPI {
             }
         }
 
+        // Reusable sync executor to run code on main server thread
         syncExecutor = Sponge.getScheduler().createSyncExecutor(this);
+
+        // Register custom serializer for WebHook class
+        TypeSerializers.getDefaultSerializers().registerType(TypeToken.of(WebHook.class), new WebHookSerializer());
     }
 
     @Listener
@@ -140,9 +163,8 @@ public class WebAPI {
         // Create permission handler
         authHandler = new AuthHandler();
 
-        loadConfig(null);
-
-        CommandRegistry.init();
+        // Main init function, that is also called when reloading the plugin
+        init(null);
 
         Reflections.log = null;
         this.reflections = new Reflections();
@@ -150,27 +172,39 @@ public class WebAPI {
         logger.info(WebAPI.NAME + " ready");
     }
 
-    private void loadConfig(Player player) {
+    private void init(Player triggeringPlayer) {
         logger.info("Loading configuration...");
 
         Tuple<ConfigurationLoader, ConfigurationNode> tup = loadWithDefaults("config.conf", "defaults/config.conf");
         ConfigurationNode config = tup.getSecond();
 
+        devMode = config.getNode("devMode").getBoolean();
         serverHost = config.getNode("host").getString();
         serverPort = config.getNode("port").getInt();
         CmdServlet.CMD_WAIT_TIME = config.getNode("cmdWaitTime").getInt();
-        BlockServlet.MAX_BLOCK_VOLUME_SIZE = config.getNode("maxBlockVolumeSize").getInt();
+        Blocks.MAX_BLOCK_GET_SIZE = config.getNode("maxBlockGetSize").getInt();
+        Blocks.MAX_BLOCK_UPDATE_SIZE = config.getNode("maxBlockUpdateSize").getInt();
+        BlockUpdate.MAX_BLOCKS_PER_SECOND = config.getNode("maxBlocksPerSecond").getInt();
 
-        authHandler.reloadConfig();
+        if (devMode)
+            logger.info("WebAPI IS RUNNING IN DEV MODE. USING NON-SHADOWED REFERENCES!");
 
-        WebHooks.reloadConfig();
+        authHandler.init();
 
-        JsonConverter.initSerializers();
-        JsonConverter.loadExtraSerializers();
+        Extensions.init();
+
+        WebHooks.init();
+
+        JsonConverter.init();
 
         CacheConfig.init();
 
-        if (player != null) player.sendMessage(Text.builder().color(TextColors.AQUA).append(Text.of("[" + WebAPI.NAME + "] The configuration files have been reloaded!")).toText());
+        CommandRegistry.init();
+
+        if (triggeringPlayer != null) {
+            triggeringPlayer.sendMessage(Text.builder().color(TextColors.AQUA)
+                    .append(Text.of("[" + WebAPI.NAME + "] " + WebAPI.NAME + " has been reloaded!")).build());
+        }
     }
 
     private void startWebServer(Player player) {
@@ -188,7 +222,7 @@ public class WebAPI {
             server.addConnector(http);
 
             // Add error handler
-            server.addBean(new WebAPIErrorHandler(server));
+            server.addBean(new ErrorHandler(server));
 
             // Collection of all handlers
             List<Handler> handlers = new LinkedList<>();
@@ -207,19 +241,18 @@ public class WebAPI {
             list.setHandlers(new Handler[]{ authHandler, new RateLimitHandler(), servletsContext });
             handlers.add(list);
 
-            servletsContext.addServlet(InfoServlet.class, "/info");
-
             servletsContext.addServlet(BlockServlet.class, "/block/*");
-            servletsContext.addServlet(HistoryServlet.class, "/history/*");
+            servletsContext.addServlet(ClassServlet.class, "/class/*");
             servletsContext.addServlet(CmdServlet.class, "/cmd/*");
-            servletsContext.addServlet(WorldServlet.class, "/world/*");
+            servletsContext.addServlet(EntityServlet.class, "/entity/*");
+            servletsContext.addServlet(HistoryServlet.class, "/history/*");
+            servletsContext.addServlet(InfoServlet.class, "/info");
+            servletsContext.addServlet(MessageServlet.class, "/message/*");
             servletsContext.addServlet(PlayerServlet.class, "/player/*");
             servletsContext.addServlet(PluginServlet.class, "/plugin/*");
             servletsContext.addServlet(RecipeServlet.class, "/recipe/*");
-            servletsContext.addServlet(EntityServlet.class, "/entity/*");
             servletsContext.addServlet(TileEntityServlet.class, "/tile-entity/*");
-
-            servletsContext.addServlet(ClassServlet.class, "/class/*");
+            servletsContext.addServlet(WorldServlet.class, "/world/*");
 
             // Add collection of handlers to server
             ContextHandlerCollection coll = new ContextHandlerCollection();
@@ -299,9 +332,9 @@ public class WebAPI {
         }
     }
 
-    public static void executeCommand(String command, WebAPICommandSource source) {
+    public static CommandResult executeCommand(String command, CommandSource source) {
         CommandManager cmdManager = Sponge.getGame().getCommandManager();
-        cmdManager.process(source, command);
+        return cmdManager.process(source, command);
     }
 
     @Listener
@@ -311,11 +344,11 @@ public class WebAPI {
 
         startWebServer(null);
 
-        WebHooks.notifyHooks(WebHooks.WebHookType.SERVER_START, JsonConverter.toString(event));
+        WebHooks.notifyHooks(WebHooks.WebHookType.SERVER_START, event);
     }
     @Listener
     public void onServerStop(GameStoppedServerEvent event) {
-        WebHooks.notifyHooks(WebHooks.WebHookType.SERVER_STOP, JsonConverter.toString(event));
+        WebHooks.notifyHooks(WebHooks.WebHookType.SERVER_STOP, event);
 
         stopWebServer();
     }
@@ -330,45 +363,51 @@ public class WebAPI {
 
         stopWebServer();
 
-        loadConfig(p.orElse(null));
+        init(p.orElse(null));
 
         startWebServer(p.orElse(null));
 
         logger.info("Reloaded " + WebAPI.NAME);
     }
 
-    @Listener
+    @Listener(order = Order.POST)
     public void onWorldLoad(LoadWorldEvent event) {
         DataCache.addWorld(event.getTargetWorld());
+
+        WebHooks.notifyHooks(WebHooks.WebHookType.WORLD_LOAD, event);
     }
-    @Listener
+    @Listener(order = Order.POST)
     public void onWorldUnload(UnloadWorldEvent event) {
         DataCache.removeWorld(event.getTargetWorld().getUniqueId());
+
+        WebHooks.notifyHooks(WebHooks.WebHookType.WORLD_UNLOAD, event);
+    }
+    @Listener(order = Order.POST)
+    public void onWorldSave(SaveWorldEvent event) {
+        WebHooks.notifyHooks(WebHooks.WebHookType.WORLD_SAVE, event);
     }
 
     @Listener(order = Order.POST)
     public void onPlayerJoin(ClientConnectionEvent.Join event) {
         DataCache.addPlayer(event.getTargetEntity());
 
-        WebHooks.notifyHooks(WebHooks.WebHookType.PLAYER_JOIN, JsonConverter.toString(event));
+        WebHooks.notifyHooks(WebHooks.WebHookType.PLAYER_JOIN, event);
     }
     @Listener(order = Order.POST)
     public void onPlayerLeave(ClientConnectionEvent.Disconnect event) {
-        // Get the message first because the player is removed from cache afterwards
-        String message = JsonConverter.toString(event);
+        // Send the message first because the player is removed from cache afterwards
+        WebHooks.notifyHooks(WebHooks.WebHookType.PLAYER_LEAVE, event);
 
         DataCache.removePlayer(event.getTargetEntity().getUniqueId());
-
-        WebHooks.notifyHooks(WebHooks.WebHookType.PLAYER_LEAVE, message);
     }
 
     @Listener(order = Order.POST)
     public void onUserKick(KickPlayerEvent event) {
-        WebHooks.notifyHooks(WebHooks.WebHookType.PLAYER_KICK, JsonConverter.toString(event));
+        WebHooks.notifyHooks(WebHooks.WebHookType.PLAYER_KICK, event);
     }
     @Listener(order = Order.POST)
     public void onUserBan(BanUserEvent event) {
-        WebHooks.notifyHooks(WebHooks.WebHookType.PLAYER_BAN, JsonConverter.toString(event));
+        WebHooks.notifyHooks(WebHooks.WebHookType.PLAYER_BAN, event);
     }
 
     @Listener(order = Order.POST)
@@ -383,23 +422,27 @@ public class WebAPI {
 
         Entity ent = event.getTargetEntity();
         if (ent instanceof Player) {
-            WebHooks.notifyHooks(WebHooks.WebHookType.PLAYER_DEATH, JsonConverter.toString(event));
+            WebHooks.notifyHooks(WebHooks.WebHookType.PLAYER_DEATH, event);
         }
     }
 
     @Listener(order = Order.POST)
     public void onPlayerChat(MessageChannelEvent.Chat event, @First Player player) {
         CachedChatMessage msg = DataCache.addChatMessage(player, event);
-        WebHooks.notifyHooks(WebHooks.WebHookType.CHAT, JsonConverter.toString(msg));
+        WebHooks.notifyHooks(WebHooks.WebHookType.CHAT, msg);
     }
 
     @Listener(order = Order.POST)
+    public void onInteractBlock(InteractBlockEvent event) {
+        WebHooks.notifyHooks(WebHooks.WebHookType.INTERACT_BLOCK, event);
+    }
+    @Listener(order = Order.POST)
     public void onInteractInventory(InteractInventoryEvent.Open event) {
-        WebHooks.notifyHooks(WebHooks.WebHookType.INVENTORY_OPEN, JsonConverter.toString(event));
+        WebHooks.notifyHooks(WebHooks.WebHookType.INVENTORY_OPEN, event);
     }
     @Listener(order = Order.POST)
     public void onInteractInventory(InteractInventoryEvent.Close event) {
-        WebHooks.notifyHooks(WebHooks.WebHookType.INVENTORY_CLOSE, JsonConverter.toString(event));
+        WebHooks.notifyHooks(WebHooks.WebHookType.INVENTORY_CLOSE, event);
     }
 
     @Listener(order = Order.POST)
@@ -410,13 +453,77 @@ public class WebAPI {
         if (player.getAchievementData().achievements().get().stream().anyMatch(a -> a.getId().equals(event.getAchievement().getId())))
             return;
 
-        WebHooks.notifyHooks(WebHooks.WebHookType.ACHIEVEMENT, JsonConverter.toString(event));
+        WebHooks.notifyHooks(WebHooks.WebHookType.ACHIEVEMENT, event);
+    }
+
+    @Listener(order = Order.POST)
+    public void onGenerateChunk(GenerateChunkEvent event) {
+        WebHooks.notifyHooks(WebHooks.WebHookType.GENERATE_CHUNK, event);
+    }
+
+    @Listener(order = Order.POST)
+    public void onExplosion(ExplosionEvent event) {
+        WebHooks.notifyHooks(WebHooks.WebHookType.EXPLOSION, event);
     }
 
     @Listener(order = Order.POST)
     public void onCommand(SendCommandEvent event) {
         CachedCommandCall call = DataCache.addCommandCall(event);
 
-        WebHooks.notifyHooks(WebHooks.WebHookType.COMMAND, JsonConverter.toString(call));
+        WebHooks.notifyHooks(WebHooks.WebHookType.COMMAND, call);
+    }
+
+    @Listener(order = Order.POST)
+    public void onBlockUpdateStatusChange(BlockUpdateStatusChangeEvent event) {
+        BlockUpdate update = event.getBlockUpdate();
+        switch (update.getStatus()) {
+            case DONE:
+                logger.info("Block update " + update.getUUID() + " is done, " + update.getBlocksSet() + " blocks set");
+                break;
+
+            case ERRORED:
+                logger.warn("Block update " + update.getUUID() + " failed: " + update.getError());
+                break;
+
+            case PAUSED:
+                logger.info("Block update " + update.getUUID() + " paused");
+                break;
+
+            case RUNNING:
+                logger.info("Block update " + update.getUUID() + " started");
+                break;
+        }
+
+        WebHooks.notifyHooks(WebHooks.WebHookType.BLOCK_UPDATE_STATUS, event);
+    }
+
+    public static void runOnMain(Runnable runnable) {
+        if (Sponge.getServer().isMainThread()) {
+            runnable.run();
+        } else {
+            CompletableFuture future = CompletableFuture.runAsync(runnable, WebAPI.syncExecutor);
+            try {
+                future.get();
+            } catch (InterruptedException | ExecutionException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+    public static <T> Optional<T> runOnMain(Supplier<T> supplier) {
+        if (Sponge.getServer().isMainThread()) {
+            T obj = supplier.get();
+            return obj == null ? Optional.empty() : Optional.of(obj);
+        } else {
+            CompletableFuture<T> future = CompletableFuture.supplyAsync(supplier, WebAPI.syncExecutor);
+            try {
+                T obj = future.get();
+                if (obj == null)
+                    return Optional.empty();
+                return Optional.of(obj);
+            } catch (InterruptedException | ExecutionException e) {
+                e.printStackTrace();
+                return Optional.empty();
+            }
+        }
     }
 }
